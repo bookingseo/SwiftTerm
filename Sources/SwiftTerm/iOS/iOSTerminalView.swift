@@ -237,6 +237,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var textInputStorage: String = ""
     var pendingAutoPeriodDeleteWasSpace: Bool = false
 
+    // How many characters of the current input line have actually been transmitted to the
+    // PTY as committed plain text since the last newline / buffer reset — i.e. the length of
+    // the pending line on the remote side. Needed because the iOS Vietnamese telex keyboard
+    // commits raw letters one by one (each sent to the shell) and then retro-absorbs them into
+    // an IME composition; when that absorption happens the transmitted prefix must be erased on
+    // the wire with exactly that many backspaces — no more (over-erasing deletes real committed
+    // characters), no fewer (under-erasing leaves the prefix and the commit re-sends the whole
+    // syllable, doubling it). This watermark bounds the erase to what was truly transmitted.
+    var transmittedLineLength: Int = 0
+
     // This tracks the marked text, part of the UITextInput protocol, which is used to flag temporary data entry, that might
     // be removed afterwards by the input system (input methods will insert approximiations, mark and change on demand)
     var _markedTextRange: TextRange?
@@ -1617,6 +1627,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 self.send(data: returnByteSequence [0...])
             } else {
                 self.send(txt: textToInsert)
+                // Committed plain text just went onto the remote line — track it so a later
+                // IME absorption erases exactly this much and no more.
+                transmittedLineLength += textToInsert.count
             }
         }
 
@@ -2104,6 +2117,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 // In that scenario, we should just send the backspace character to the terminal
                 pendingAutoPeriodDeleteWasSpace = false
                 self.sendBackspaceKey()
+                transmittedLineLength = max(0, transmittedLineLength - 1)
                 uitiLog("deleteBackward() no text to delete, sending backspace")
                 return
             }
@@ -2119,12 +2133,14 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             rangeStartPosition = TextPosition(offset: rangeStartIndex)
 
             self.sendBackspaceKey()
+            transmittedLineLength = max(0, transmittedLineLength - 1)
         } else if _markedTextRange != nil {
-            // VELOTERM PATCH: the range to delete is IME MARKED text (composition in progress —
-            // Vietnamese/CJK). Marked text is shown locally but has NEVER been transmitted to the
-            // PTY, so deleting it must send NO backspace to the shell — otherwise upstream's
-            // one-backspace-per-marked-character deletes real, already-committed characters on the
-            // shell line. Just drop the marked text from the local shadow buffer.
+            // The range to delete is IME MARKED text (composition in progress — Vietnamese/CJK).
+            // Marked text is not on the wire: a fresh composition was never transmitted, and any
+            // already-committed characters a composition absorbed were erased on the wire the
+            // moment they were absorbed (see setMarkedText). So deleting marked text must send NO
+            // backspace to the shell — otherwise a one-backspace-per-marked-character delete would
+            // remove real committed characters on the shell line. Just drop it from the local shadow.
             pendingAutoPeriodDeleteWasSpace = false
             beginTextInputEdit()
             textInputStorage.removeSubrange(rangeToDelete.fullRange(in: textInputStorage))
@@ -2139,9 +2155,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             pendingAutoPeriodDeleteWasSpace = false
             beginTextInputEdit()
             self.sendBackspaceKey()
+            transmittedLineLength = max(0, transmittedLineLength - 1)
             textInputStorage.removeSubrange(rangeToDelete.fullRange(in: textInputStorage))
         }
-        
+
         _markedTextRange = nil
         _selectedTextRange = TextRange(from: rangeStartPosition, to: rangeStartPosition)
 

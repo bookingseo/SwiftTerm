@@ -153,6 +153,9 @@ extension TerminalView: UITextInput {
             self.send ([0x7f])
         }
         self.send (txt: replacementText)
+        // Keep the transmitted-line watermark in step with the wire: this replace erased
+        // `backspaces` committed characters and sent `replacementText` in their place.
+        transmittedLineLength = max(0, transmittedLineLength - backspaces) + replacementText.count
 
         let insertionIndex = r.startPosition.offset
         textInputStorage.replaceSubrange(r.fullRange(in: textInputStorage), with: replacementText)
@@ -232,6 +235,23 @@ extension TerminalView: UITextInput {
         let rangeToReplace = _markedTextRange ?? _selectedTextRange
         let rangeStartPosition = rangeToReplace.startPosition
 
+        // VELOTERM: a composition that STARTS by absorbing already-committed text — no marked range
+        // yet, but a non-empty selection over committed characters — is the iOS Vietnamese telex
+        // flow: raw letters are committed one-by-one (each sent to the shell) and then retro-grabbed
+        // into an IME composition. Those characters are already on the remote line, so erase exactly
+        // the transmitted prefix here (bounded by what we truly sent — never more, to avoid deleting
+        // real earlier characters). The composition then proceeds locally and its eventual commit
+        // lands on a clean line instead of doubling the syllable. Updating an existing composition
+        // (_markedTextRange != nil) or composing from a bare caret (empty selection) sends nothing —
+        // that text was never transmitted.
+        if markedText != nil, _markedTextRange == nil, !rangeToReplace.isEmpty {
+            let erase = min(rangeToReplace.length, transmittedLineLength)
+            for _ in 0..<erase {
+                self.send([0x7f])
+            }
+            transmittedLineLength -= erase
+        }
+
         beginTextInputEdit()
 
         if let newText = markedText {
@@ -263,6 +283,8 @@ extension TerminalView: UITextInput {
         textInputStorage = ""
         _selectedTextRange = TextRange (from: TextPosition(offset: 0), to: TextPosition(offset: 0))
         _markedTextRange = nil
+        // The line was submitted / cleared — nothing of it remains on the remote line.
+        transmittedLineLength = 0
         endTextInputEdit()
     }
     
