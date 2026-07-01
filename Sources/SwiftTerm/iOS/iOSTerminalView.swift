@@ -2119,17 +2119,26 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             rangeStartPosition = TextPosition(offset: rangeStartIndex)
 
             self.sendBackspaceKey()
-        } else {
+        } else if _markedTextRange != nil {
+            // VELOTERM PATCH: the range to delete is IME MARKED text (composition in progress —
+            // Vietnamese/CJK). Marked text is shown locally but has NEVER been transmitted to the
+            // PTY, so deleting it must send NO backspace to the shell — otherwise upstream's
+            // one-backspace-per-marked-character deletes real, already-committed characters on the
+            // shell line. Just drop the marked text from the local shadow buffer.
             pendingAutoPeriodDeleteWasSpace = false
             beginTextInputEdit()
-            // Send as many backspaces that are in the range to delete. When on auto-repeat, after a some time
-            // pressing the backspace, it will delete chunks of text at a time.
-            let oldText = textInputStorage[rangeToDelete.fullRange(in: textInputStorage)]
-            let backspaces = oldText.count
-            for _ in 0..<backspaces {
-                self.sendBackspaceKey()
-            }
-
+            textInputStorage.removeSubrange(rangeToDelete.fullRange(in: textInputStorage))
+        } else {
+            // VELOTERM PATCH: a non-empty selection with NO marked text is iOS's accelerated
+            // hold-to-delete (the software keyboard switches held-backspace into word/line deletes).
+            // Upstream emitted one backspace per character of the LOCAL shadow line, which desyncs
+            // from the real shell line after any raw-byte input the app sends (^C, arrow keys, Tab,
+            // history recall) — so the burst deleted far past the visible line ("hold delete wipes
+            // the whole line / everything"). Send exactly ONE backspace and let the remote shell's
+            // own key-repeat handle a genuinely sustained press.
+            pendingAutoPeriodDeleteWasSpace = false
+            beginTextInputEdit()
+            self.sendBackspaceKey()
             textInputStorage.removeSubrange(rangeToDelete.fullRange(in: textInputStorage))
         }
         
