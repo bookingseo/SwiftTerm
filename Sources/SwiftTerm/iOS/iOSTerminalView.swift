@@ -1626,10 +1626,20 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 resetInputBuffer()
                 self.send(data: returnByteSequence [0...])
             } else {
+                // commitTextInput just replaced `rangeToReplace` in the LOCAL buffer with
+                // textToInsert. The wire must mirror that same edit — but the replaced range
+                // was already transmitted to the PTY, so erase it on the wire FIRST, then send
+                // the new text. Without this, an IME that recomposes a syllable by committing
+                // the whole new form over the old one (iOS Vietnamese telex: "ba" -> "bằng")
+                // re-sends the unchanged prefix on top of what is already there and doubles it
+                // on the remote line. Edits land at the line end, so the transmitted content is
+                // a prefix of the buffer and `transmittedLineLength - rangeStartIndex` is exactly
+                // the stale tail to erase (bounded to what we actually sent). `replace()` already
+                // does this for its path; commitTextInput was the one path that forgot to.
+                let erase = max(0, transmittedLineLength - rangeStartIndex)
+                for _ in 0..<erase { self.sendBackspaceKey() }
                 self.send(txt: textToInsert)
-                // Committed plain text just went onto the remote line — track it so a later
-                // IME absorption erases exactly this much and no more.
-                transmittedLineLength += textToInsert.count
+                transmittedLineLength = rangeStartIndex + textToInsert.count
             }
         }
 
