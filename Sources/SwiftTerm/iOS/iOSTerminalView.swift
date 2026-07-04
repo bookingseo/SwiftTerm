@@ -566,23 +566,52 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     ///  - pos: the location where this was triggered in the buffer, it used at a later point
     ///  to auto-select a word
     func showContextMenu (forRegion: CGRect, pos: Position) {
-        var items: [UIMenuItem] = []
-        
         lastLongSelect = pos
         lastLongSelectRegion = forRegion
 
-        //GAR: Declutter context menu
-        //items.append (UIMenuItem(title: "Reset", action: #selector(resetCmd)))
-        
-        // Configure the shared menu controller
-        let menuController = UIMenuController.shared
-        menuController.menuItems = items
-        
-        // Set the location of the menu in the view.
-        //let menuLocation = CGRect (origin: at, size: CGSize (width: cellDimension.width, height: cellDimension.height))
-        menuController.showMenu(from: self, rect: forRegion)
+        if #available(iOS 16.0, *) {
+            // UIMenuController stopped being reliable after its iOS 16 deprecation; the
+            // supported path is UIEditMenuInteraction, which builds the standard edit menu
+            // (Copy/Paste/Select/Select All) from canPerformAction over the responder chain.
+            let configuration = UIEditMenuConfiguration(
+                identifier: nil,
+                sourcePoint: CGPoint(x: forRegion.midX, y: forRegion.minY))
+            editMenuInteraction?.presentEditMenu(with: configuration)
+        } else {
+            let menuController = UIMenuController.shared
+            menuController.menuItems = []
+            menuController.showMenu(from: self, rect: forRegion)
+        }
     }
-    
+
+    /// Dismisses the context menu regardless of which presentation backend is in use.
+    func hideContextMenu () {
+        if #available(iOS 16.0, *) {
+            editMenuInteraction?.dismissMenu()
+        } else if UIMenuController.shared.isMenuVisible {
+            UIMenuController.shared.hideMenu()
+        }
+    }
+
+    /// Whether the context menu is currently on screen (either backend).
+    var isContextMenuVisible: Bool {
+        if #available(iOS 16.0, *) {
+            return editMenuVisible
+        } else {
+            return UIMenuController.shared.isMenuVisible
+        }
+    }
+
+    // UIEditMenuInteraction is iOS 16+; stored type-erased so the class keeps its iOS 14 floor.
+    private var _editMenuInteraction: Any? = nil
+    @available(iOS 16.0, *)
+    var editMenuInteraction: UIEditMenuInteraction? {
+        get { _editMenuInteraction as? UIEditMenuInteraction }
+        set { _editMenuInteraction = newValue }
+    }
+    // Tracked via the interaction delegate (UIEditMenuInteraction has no isMenuVisible).
+    var editMenuVisible = false
+
     // This is a position relative to the buffer
     var lastLongSelect: Position?
     var lastLongSelectRegion = CGRect.zero
@@ -604,14 +633,42 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     @objc func longPress (_ gestureRecognizer: UILongPressGestureRecognizer)
     {
-         if gestureRecognizer.state == .began {
-             let _ = self.becomeFirstResponder()
-             let tapLocation = gestureRecognizer.location(in: gestureRecognizer.view)
-             let tapRegion = makeContextMenuRegionForTap (point: tapLocation)
-             
-             showContextMenu (forRegion: tapRegion,
-                              pos: calculateTapHit (gesture: gestureRecognizer).grid)
-          }
+        switch gestureRecognizer.state {
+        case .began:
+            // Long-press is unambiguous local-selection intent, so it selects the word under
+            // the finger immediately — even while the remote owns the mouse (a long-press is
+            // never forwarded as a mouse event, unlike taps and pans).
+            let _ = self.becomeFirstResponder()
+            let hit = calculateTapHit (gesture: gestureRecognizer).grid
+            selection.selectWordOrExpression (at: hit, in: terminal.displayBuffer)
+            selection.selectionMode = .character
+            enableSelectionPanGesture()
+            queuePendingDisplay()
+        case .changed:
+            // Dragging while still pressed extends the selection from the edge opposite the
+            // drag direction, so the initially selected word stays inside the selection.
+            guard selection.active else { break }
+            let hit = calculateTapHit (gesture: gestureRecognizer).grid
+            if selection.pivot == nil {
+                selection.pivot = Position.compare (hit, selection.start) == .before
+                    ? selection.end : selection.start
+            }
+            selection.pivotExtend (bufferPosition: hit)
+            requestDisplay()
+        case .ended:
+            if selection.active {
+                showContextMenu (forRegion: makeContextMenuRegionForSelection(),
+                                 pos: calculateTapHit (gesture: gestureRecognizer).grid)
+            } else {
+                // Nothing was selectable under the finger: fall back to the plain menu
+                // (Paste / Select All) anchored at the press location.
+                let tapLocation = gestureRecognizer.location(in: gestureRecognizer.view)
+                showContextMenu (forRegion: makeContextMenuRegionForTap (point: tapLocation),
+                                 pos: calculateTapHit (gesture: gestureRecognizer).grid)
+            }
+        default:
+            break
+        }
     }
     
     /// This controls whether the backspace should send ^? or ^H, the default is ^?
@@ -716,6 +773,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             }
 
             if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+                // A live local selection captures the tap as "dismiss the selection",
+                // mirroring the non-reporting branch; it is not forwarded to the remote.
+                if selection.active {
+                    selection.selectNone()
+                    disableSelectionPanGesture()
+                    hideContextMenu()
+                    queuePendingDisplay()
+                    return
+                }
                 sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
 
                 if terminal.mouseMode.sendButtonRelease() {
@@ -726,8 +792,8 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                     selection.selectNone()
                     disableSelectionPanGesture()
                 }
-                if UIMenuController.shared.isMenuVisible {
-                    UIMenuController.shared.hideMenu()
+                if isContextMenuVisible {
+                    hideContextMenu()
                 } else {
                     let location = gestureRecognizer.location(in: gestureRecognizer.view)
                     let tapLoc = calculateTapHit(gesture: gestureRecognizer).grid
@@ -873,19 +939,30 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     @objc func panMouseHandler (_ gestureRecognizer: UIPanGestureRecognizer){
         guard gestureRecognizer.view != nil else { return }
+        // While a local selection is live, drags belong to the selection pan (extend /
+        // handle drag) — never stream mouse-drag events to the remote underneath it.
+        // The release for an already-streamed press still goes out below (.cancelled
+        // fires when enableSelectionPanGesture removes this recognizer mid-gesture).
         if allowMouseReporting && terminal.mouseMode != .off {
             switch gestureRecognizer.state {
             case .began:
+                // A live local selection owns drags (extend / handle drag); do not open a
+                // mouse-drag stream to the remote underneath it.
+                if selection.active { return }
                 // send the initial tap
                 if terminal.mouseMode.sendButtonPress() {
                     sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
+                    mousePanPressStreamed = true
                 }
             case .ended, .cancelled:
-                if terminal.mouseMode.sendButtonRelease() {
+                // Only balance a press that was actually streamed — a pan whose .began was
+                // consumed by the selection must not emit a stray button-release.
+                if mousePanPressStreamed, terminal.mouseMode.sendButtonRelease() {
                     sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
                 }
+                mousePanPressStreamed = false
             case .changed:
-                if terminal.mouseMode.sendButtonTracking() {
+                if mousePanPressStreamed, terminal.mouseMode.sendButtonTracking() {
                     let hit = calculateTapHit(gesture: gestureRecognizer)
                     if let grid = hit.grid.toScreenCoordinate(from: terminal.displayBuffer) {
                         terminal.sendMotion(buttonFlags: encodeFlags(release: false), x: grid.col, y: grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
@@ -896,6 +973,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             }
         }
     }
+
+    // True while a mouse-pan button-press has been streamed to the remote and its
+    // balancing release has not yet been sent.
+    var mousePanPressStreamed = false
    
     @MainActor
     func startSelectionTimer (_ callback: @MainActor @escaping ()->()) {
@@ -1001,6 +1082,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     var panSelectionGesture: UIPanGestureRecognizer?
     func enableSelectionPanGesture () {
+        // While a selection is live its pan owns drags: suspend the remote mouse pan so the
+        // two plain pan recognizers never race for the same touches. Removing the mouse pan
+        // mid-gesture cancels it, and panMouseHandler's .cancelled balances any streamed press.
+        disableMousePanGesture()
         guard panSelectionGesture == nil else {
             return
         }
@@ -1008,20 +1093,32 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         addGestureRecognizer(gesture)
         self.panSelectionGesture = gesture
     }
-    
+
     func disableSelectionPanGesture() {
+        // The selection is gone — hand drags back to the remote if it owns the mouse.
+        defer {
+            if terminal.mouseMode != .off {
+                enableMousePanGesture()
+            }
+        }
         guard let gesture = panSelectionGesture else {
             return
         }
         removeGestureRecognizer(gesture)
         panSelectionGesture = nil
     }
-    
+
     func setupGestures ()
     {
         let longPress = UILongPressGestureRecognizer (target: self, action: #selector(longPress(_:)))
         longPress.minimumPressDuration = 0.7
         addGestureRecognizer(longPress)
+
+        if #available(iOS 16.0, *) {
+            let interaction = UIEditMenuInteraction(delegate: self)
+            addInteraction(interaction)
+            editMenuInteraction = interaction
+        }
         
         let singleTap = UITapGestureRecognizer (target: self, action: #selector(singleTap(_:)))
         addGestureRecognizer(singleTap)
@@ -2615,7 +2712,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 #endif
             
             if !self.selection.active {
-                UIMenuController.shared.hideMenu()
+                self.hideContextMenu()
                 self.selection.selectNone()
                 self.disableSelectionPanGesture()
             }
@@ -2700,6 +2797,28 @@ extension TerminalViewDelegate {
     }
     
     public func iTermContent (source: TerminalView, content: ArraySlice<UInt8>) {
+    }
+}
+
+// The post-iOS 16 context-menu backend. The standard edit actions (Copy / Paste /
+// Select / Select All) are derived from canPerformAction over the responder chain,
+// so the same overrides that fed UIMenuController feed this menu.
+@available(iOS 16.0, *)
+extension TerminalView: UIEditMenuInteractionDelegate {
+    public func editMenuInteraction (_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration, suggestedActions: [UIMenuElement]) -> UIMenu? {
+        UIMenu (children: suggestedActions)
+    }
+
+    public func editMenuInteraction (_ interaction: UIEditMenuInteraction, targetRectFor configuration: UIEditMenuConfiguration) -> CGRect {
+        lastLongSelectRegion
+    }
+
+    public func editMenuInteraction (_ interaction: UIEditMenuInteraction, willDisplayMenuFor configuration: UIEditMenuConfiguration, animator: UIEditMenuInteractionAnimating) {
+        editMenuVisible = true
+    }
+
+    public func editMenuInteraction (_ interaction: UIEditMenuInteraction, willDismissMenuFor configuration: UIEditMenuConfiguration, animator: UIEditMenuInteractionAnimating) {
+        editMenuVisible = false
     }
 }
 
