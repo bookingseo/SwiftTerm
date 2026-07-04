@@ -1564,6 +1564,27 @@ extension TerminalView {
 #endif
     }
     
+    /// Computes the tight dirty rectangle for an iOS/visionOS edit, in the scroll view's
+    /// content coordinate space. `getUpdateRange()` returns visible-relative rows (row 0 is
+    /// the top of the viewport, which sits at content-y == `contentOffsetY` because the scroll
+    /// view keeps `contentOffsetY == yDisp * cellHeight`). Invalidating only these rows — rather
+    /// than the whole bounds — lets a 1-3 row cursor-addressed redraw skip repainting the dozens
+    /// of unchanged rows around it. The last visible row extends to the bottom of the viewport
+    /// so wide/unicode glyph spill below the baseline is repainted. Pure/static so it is
+    /// unit-testable without a live view.
+    static func iOSDirtyRegion (rowStart: Int, rowEnd: Int, totalRows: Int,
+                                cellHeight: CGFloat, boundsWidth: CGFloat, boundsHeight: CGFloat,
+                                contentOffsetY: CGFloat) -> CGRect {
+        let top = contentOffsetY + CGFloat (rowStart) * cellHeight
+        if rowEnd == totalRows - 1 {
+            // Last visible line: extend to the bottom of the viewport.
+            return CGRect (x: 0, y: top, width: boundsWidth,
+                           height: (contentOffsetY + boundsHeight) - top)
+        }
+        return CGRect (x: 0, y: top, width: boundsWidth,
+                       height: CGFloat (rowEnd - rowStart + 1) * cellHeight)
+    }
+
     /// Update visible area
     func updateDisplay (notifyAccessibility: Bool)
     {
@@ -1632,17 +1653,25 @@ extension TerminalView {
         setNeedsDisplay(region)
 #endif
         #else
-        // TODO iOS: need to update the code above, but will do that when I get some real
-        // life data being fed into it.
+        // iOS/visionOS: invalidate only the rows that changed instead of the whole bounds.
+        // The disabled per-line cull in drawTerminalContents means draw(_:) still visits every
+        // visible row, but UIKit clips output to this dirty rect, so a vim/tmux cursor-addressed
+        // redraw (1-3 rows) no longer forces a full ~40-50 row repaint of dense colored text.
+        let region = TerminalView.iOSDirtyRegion (rowStart: rowStart, rowEnd: rowEnd,
+                                                  totalRows: terminal.rows,
+                                                  cellHeight: cellDimension.height,
+                                                  boundsWidth: bounds.width,
+                                                  boundsHeight: bounds.height,
+                                                  contentOffsetY: contentOffset.y)
         #if canImport(MetalKit)
         if metalView != nil {
             metalDirtyRange = metalVisibleRange()
             requestMetalDisplay()
         } else {
-            setNeedsDisplay(bounds)
+            setNeedsDisplay(region)
         }
         #else
-        setNeedsDisplay(bounds)
+        setNeedsDisplay(region)
         #endif
         #endif
 
