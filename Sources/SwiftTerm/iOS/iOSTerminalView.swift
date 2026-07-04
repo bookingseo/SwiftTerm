@@ -493,6 +493,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     @objc open override func paste (_ sender: Any?) {
+        // Tear selection state down whole: leaving the highlight active while handing
+        // drags back to the remote mouse pan strands a selection nothing owns.
+        selection.selectNone()
         disableSelectionPanGesture()
         if let start = UIPasteboard.general.string {
             if terminal.bracketedPasteMode {
@@ -522,6 +525,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         if let loc = lastLongSelect {
             selection.selectWordOrExpression(at: Position (col: loc.col, row: loc.row), in: terminal.displayBuffer)
             selection.selectionMode = .character
+            selection.pivot = nil
             enableSelectionPanGesture()
             DispatchQueue.main.async {
                 self.showContextMenu(forRegion:  self.makeContextMenuRegionForSelection(), pos: loc)
@@ -568,6 +572,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     func showContextMenu (forRegion: CGRect, pos: Position) {
         lastLongSelect = pos
         lastLongSelectRegion = forRegion
+
+        // Both menu backends resolve their actions over the responder chain from this view —
+        // presenting without first-responder status yields an empty or absent menu (reachable
+        // from doubleTap/tripleTap and the selection-pan .ended, which never acquire it).
+        if !isFirstResponder {
+            let _ = becomeFirstResponder()
+        }
 
         if #available(iOS 16.0, *) {
             // UIMenuController stopped being reliable after its iOS 16 deprecation; the
@@ -642,20 +653,31 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             let hit = calculateTapHit (gesture: gestureRecognizer).grid
             selection.selectWordOrExpression (at: hit, in: terminal.displayBuffer)
             selection.selectionMode = .character
+            // Re-anchor this gesture: the service's pivot survives from prior selections
+            // (it is only nil-ed on an active->inactive transition and starts non-nil), and
+            // .changed derives its anchor lazily from the freshly selected word below.
+            selection.pivot = nil
+            longPressInitialWord = (selection.start, selection.end)
             enableSelectionPanGesture()
             queuePendingDisplay()
         case .changed:
-            // Dragging while still pressed extends the selection from the edge opposite the
-            // drag direction, so the initially selected word stays inside the selection.
+            // Dragging while still pressed extends the selection. The initially selected
+            // word is a dead-zone: post-recognition finger jitter inside it must not
+            // collapse the selection; once the finger exits, the anchor locks to the edge
+            // opposite the exit direction so the word always stays inside the selection.
             guard selection.active else { break }
             let hit = calculateTapHit (gesture: gestureRecognizer).grid
             if selection.pivot == nil {
-                selection.pivot = Position.compare (hit, selection.start) == .before
-                    ? selection.end : selection.start
+                guard let word = longPressInitialWord else { break }
+                if Position.compare (hit, word.start) != .before && Position.compare (hit, word.end) != .after {
+                    break
+                }
+                selection.pivot = Position.compare (hit, word.start) == .before ? word.end : word.start
             }
             selection.pivotExtend (bufferPosition: hit)
             requestDisplay()
         case .ended:
+            longPressInitialWord = nil
             if selection.active {
                 showContextMenu (forRegion: makeContextMenuRegionForSelection(),
                                  pos: calculateTapHit (gesture: gestureRecognizer).grid)
@@ -666,10 +688,23 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 showContextMenu (forRegion: makeContextMenuRegionForTap (point: tapLocation),
                                  pos: calculateTapHit (gesture: gestureRecognizer).grid)
             }
+        case .cancelled, .failed:
+            // A system interruption mid-gesture must not strand a live selection with the
+            // remote mouse pan suspended.
+            longPressInitialWord = nil
+            if selection.active {
+                selection.selectNone()
+                disableSelectionPanGesture()
+                queuePendingDisplay()
+            }
         default:
             break
         }
     }
+
+    // The word selected at long-press .began — the drag dead-zone and the anchor edges
+    // for the extend that follows.
+    var longPressInitialWord: (start: Position, end: Position)?
     
     /// This controls whether the backspace should send ^? or ^H, the default is ^?
     public var backspaceSendsControlH: Bool = false
@@ -718,7 +753,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         if row < 0 {
             return (Position(col: 0, row: 0), toInt (point))
         }
-        return (Position(col: min (max (0, col), terminal.cols-1), row: row), toInt (point))
+        // Clamp the row into the buffer: when the content is shorter than the viewport a
+        // touch below the last line otherwise yields a row past lines.count, and the
+        // selection paths index the buffer with it directly.
+        let lastRow = max (0, terminal.displayBuffer.lines.count - 1)
+        return (Position(col: min (max (0, col), terminal.cols-1), row: min (row, lastRow)), toInt (point))
     }
 
     func encodeFlags (release: Bool) -> Int
@@ -766,6 +805,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 return
             }
 
+            // A live local selection captures the first tap as "dismiss the selection" —
+            // before link opening and before any mouse forwarding, in both reporting modes.
+            if selection.active {
+                selection.selectNone()
+                disableSelectionPanGesture()
+                hideContextMenu()
+                queuePendingDisplay()
+                return
+            }
+
             let tapHit = calculateTapHit(gesture: gestureRecognizer).grid
             if let result = linkForClick(at: tapHit, hasCommandModifier: commandActive) {
                 terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
@@ -773,25 +822,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             }
 
             if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
-                // A live local selection captures the tap as "dismiss the selection",
-                // mirroring the non-reporting branch; it is not forwarded to the remote.
-                if selection.active {
-                    selection.selectNone()
-                    disableSelectionPanGesture()
-                    hideContextMenu()
-                    queuePendingDisplay()
-                    return
-                }
                 sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
 
                 if terminal.mouseMode.sendButtonRelease() {
                     sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
                 }
             } else {
-                if selection.active {
-                    selection.selectNone()
-                    disableSelectionPanGesture()
-                }
                 if isContextMenuVisible {
                     hideContextMenu()
                 } else {
@@ -818,9 +854,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
         
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+        // A live local selection keeps taps local (re-select at the new spot) — no click is
+        // forwarded to the remote underneath it, matching singleTap and the pan handlers.
+        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !selection.active {
             sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
-            
+
             if terminal.mouseMode.sendButtonRelease() {
                 sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
             }
@@ -829,6 +867,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             let hit = calculateTapHit(gesture: gestureRecognizer).grid
             selection.selectWordOrExpression(at: hit, in: terminal.displayBuffer)
             selection.selectionMode = .character
+            selection.pivot = nil
             enableSelectionPanGesture()
             showContextMenu (forRegion: makeContextMenuRegionForSelection(), pos: hit)
             queuePendingDisplay()
@@ -843,7 +882,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
 
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+        // Same local-selection precedence as doubleTap: no click reaches the remote while a
+        // selection is live.
+        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !selection.active {
             sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
 
             if terminal.mouseMode.sendButtonRelease() {
@@ -853,6 +894,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         } else {
             let hit = calculateTapHit(gesture: gestureRecognizer).grid
             selection.select(row: hit.row)
+            selection.pivot = nil
             enableSelectionPanGesture()
             showContextMenu (forRegion: makeContextMenuRegionForSelection(), pos: hit)
             queuePendingDisplay()
@@ -943,6 +985,23 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         // handle drag) — never stream mouse-drag events to the remote underneath it.
         // The release for an already-streamed press still goes out below (.cancelled
         // fires when enableSelectionPanGesture removes this recognizer mid-gesture).
+        // Terminal states run OUTSIDE the mode gate: when the remote turns mouse reporting
+        // off mid-drag, mouseMode is already .off by the time the cancelled action runs, and
+        // the streamed-press bookkeeping must still be settled or it poisons a later gesture.
+        switch gestureRecognizer.state {
+        case .ended, .cancelled, .failed:
+            if mousePanPressStreamed {
+                // Only balance a press that was actually streamed — and only while the
+                // protocol still permits a release.
+                if allowMouseReporting && terminal.mouseMode.sendButtonRelease() {
+                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
+                }
+                mousePanPressStreamed = false
+            }
+            return
+        default:
+            break
+        }
         if allowMouseReporting && terminal.mouseMode != .off {
             switch gestureRecognizer.state {
             case .began:
@@ -954,13 +1013,6 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                     sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
                     mousePanPressStreamed = true
                 }
-            case .ended, .cancelled:
-                // Only balance a press that was actually streamed — a pan whose .began was
-                // consumed by the selection must not emit a stray button-release.
-                if mousePanPressStreamed, terminal.mouseMode.sendButtonRelease() {
-                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
-                }
-                mousePanPressStreamed = false
             case .changed:
                 if mousePanPressStreamed, terminal.mouseMode.sendButtonTracking() {
                     let hit = calculateTapHit(gesture: gestureRecognizer)
@@ -1075,6 +1127,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     func disableMousePanGesture () {
         guard let gesture = panMouseGesture else {
             return
+        }
+        // Balance any streamed press before tearing the recognizer down — cancelled-state
+        // delivery on removal is not contractual, and an unreleased button wedges the
+        // remote's drag state.
+        if mousePanPressStreamed {
+            if allowMouseReporting && terminal.mouseMode.sendButtonRelease() {
+                sharedMouseEvent(gestureRecognizer: gesture, release: true)
+            }
+            mousePanPressStreamed = false
         }
         removeGestureRecognizer(gesture)
         panMouseGesture = nil
@@ -1382,6 +1443,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var lineLeading: CGFloat = 0
     
     open func bufferActivated(source: Terminal) {
+        // Selection positions are relative to the buffer they were made in — a selection
+        // carried across an alt<->normal switch highlights unrelated cells (and keeps the
+        // remote mouse pan suspended), so it is dismissed with the buffer that owned it.
+        if selection.active {
+            selection.selectNone ()
+            disableSelectionPanGesture ()
+            hideContextMenu ()
+            queuePendingDisplay ()
+        }
         updateScroller ()
     }
     
@@ -2732,7 +2802,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     open func mouseModeChanged(source: Terminal) {
         if source.mouseMode != .off {
-            enableMousePanGesture()
+            // While a selection is live its pan owns drags — don't re-attach the mouse pan
+            // underneath it (mouseMode's didSet fires on every DECSET, including same-value
+            // re-asserts from tmux pane switches / vim focus events). The selection-pan
+            // teardown restores the mouse pan when the selection is dismissed.
+            if panSelectionGesture == nil {
+                enableMousePanGesture()
+            }
         } else {
             disableMousePanGesture()
         }
@@ -2806,14 +2882,26 @@ extension TerminalViewDelegate {
 @available(iOS 16.0, *)
 extension TerminalView: UIEditMenuInteractionDelegate {
     public func editMenuInteraction (_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration, suggestedActions: [UIMenuElement]) -> UIMenu? {
-        UIMenu (children: suggestedActions)
+        var children = suggestedActions
+        // The system's suggested set for a plain UIResponder is undocumented — make sure the
+        // selection entry points exist even if the suggestions omit them.
+        let suggestedSelectors = suggestedActions
+            .compactMap { $0 as? UICommand }
+            .map { $0.action }
+        if !selection.active && !suggestedSelectors.contains(#selector(select(_:))) {
+            children.append (UIAction (title: "Select") { [weak self] _ in self?.select (nil) })
+        }
+        if !suggestedSelectors.contains(#selector(selectAll(_:))) {
+            children.append (UIAction (title: "Select All") { [weak self] _ in self?.selectAll (nil) })
+        }
+        return UIMenu (children: children)
     }
 
     public func editMenuInteraction (_ interaction: UIEditMenuInteraction, targetRectFor configuration: UIEditMenuConfiguration) -> CGRect {
         lastLongSelectRegion
     }
 
-    public func editMenuInteraction (_ interaction: UIEditMenuInteraction, willDisplayMenuFor configuration: UIEditMenuConfiguration, animator: UIEditMenuInteractionAnimating) {
+    public func editMenuInteraction (_ interaction: UIEditMenuInteraction, willPresentMenuFor configuration: UIEditMenuConfiguration, animator: UIEditMenuInteractionAnimating) {
         editMenuVisible = true
     }
 
